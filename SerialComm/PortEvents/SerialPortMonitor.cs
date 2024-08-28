@@ -3,6 +3,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Management;
+using System.Text.RegularExpressions;
 
 namespace SerialComm.PortEvents
 {
@@ -35,6 +36,7 @@ namespace SerialComm.PortEvents
         private bool usbHubArrivalSubscribed;
         private ManagementEventWatcher usbHubRemoval;
         private bool usbHubRemovalSubscribed;
+        private object serialPortChangeLockObj = new object();
 
         private ManagementEventWatcher usbSerialArrival;
         private ManagementEventWatcher usbSerialRemoval;
@@ -92,9 +94,37 @@ namespace SerialComm.PortEvents
 
         private string[] GetAvailableSerialPorts()
         {
-            string[] portNames = System.IO.Ports.SerialPort.GetPortNames();
+            // Find all PnP devices with COM
+            using ManagementObjectSearcher searcher = new ManagementObjectSearcher("SELECT * FROM Win32_PnPEntity WHERE Caption like '%(COM%'");
+
+            List<string> validComPorts = new List<string>();
+            foreach (ManagementObject queryObj in searcher.Get())
+            {
+                string pattern = @"\(COM(\d+)\)";
+                Match match = Regex.Match(queryObj["Name"].ToString(), pattern);
+                if (match.Success)
+                {
+                    string comPort = "COM" + match.Groups[1].Value;
+
+                    // Look for valid COM ports with status OK
+                    if (queryObj["Status"].ToString().Equals("OK", StringComparison.OrdinalIgnoreCase))
+                    {
+                        validComPorts.Add(comPort);
+                    }
+                    else
+                    {
+                        Console.WriteLine($"Invalid COM port: {comPort}");
+                    }
+                }
+            }
+
+            if (validComPorts.Count > 0)
+            {
+                Console.WriteLine($"Found valid COM ports: {string.Join(", ", validComPorts)}");
+            }
+
             List<string> supportedPidVid = GetAvailableIdTechDevices();
-            return portNames.Concat(supportedPidVid).ToArray();
+            return validComPorts.Concat(supportedPidVid).ToArray();
         }
 
         private List<string> GetAvailableIdTechDevices()
@@ -161,7 +191,7 @@ namespace SerialComm.PortEvents
         private void RaiseUsbSerialPortsChangedIfNecessary(object sender, EventArrivedEventArgs eventArgs)
         {
             PortEventType eventType = GetEventType(eventArgs.NewEvent.GetPropertyValue("EventType").ToString());
-            lock (serialPorts)
+            lock (serialPortChangeLockObj)
             {
                 string[] availableSerialPorts = GetAvailableSerialPorts();
 
@@ -174,7 +204,10 @@ namespace SerialComm.PortEvents
                         {
                             serialPorts = availableSerialPorts;
 
-                            ComportEventOccured?.Invoke(PortEventType.Insertion, added[0]);
+                            foreach (var port in added)
+                            {
+                                ComportEventOccured?.Invoke(PortEventType.Insertion, port);
+                            }
                         }
                     }
                 }
@@ -185,7 +218,10 @@ namespace SerialComm.PortEvents
                     {
                         serialPorts = availableSerialPorts;
 
-                        ComportEventOccured?.Invoke(PortEventType.Removal, removed[0]);
+                        foreach (var port in removed)
+                        {
+                            ComportEventOccured?.Invoke(PortEventType.Removal, port);
+                        }
                     }
                 }
             }
@@ -219,7 +255,7 @@ namespace SerialComm.PortEvents
 
         private void RaiseUsbHubPortsChangedIfNecessary(PortEventType eventType, EventArrivedEventArgs eventArgs)
         {
-            lock (serialPorts)
+            lock (serialPortChangeLockObj)
             {
                 using (ManagementBaseObject targetObject = eventArgs.NewEvent["TargetInstance"] as ManagementBaseObject)
                 {
